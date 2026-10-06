@@ -7,13 +7,19 @@ delivers the complete response body at once. That rules out request
 mirroring and spilling to external storage, and any callout whose payload
 may be larger than the Wasm VM's memory.
 
-Concrete example: an AI governance gateway (Proxy-Wasm in Envoy) that
-decides whether to block a request before it reaches the inference
-provider, while capturing the raw request body, which is unbounded in
-size, to a spill store. The plugin needs to copy each downstream body
-chunk into an HTTP callout as it arrives, without holding the whole body
-in Wasm memory. When the spill store is slower than the client, the
-plugin needs to slow the downstream request down.
+Concrete example: synchronous AI governance in Envoy. Before a request
+reaches the inference provider, the plugin:
+
+1. tees the raw request body to two streaming calls at once: a spill
+   store (for audit) and a governance endpoint, which scans the content
+   as it arrives and may deny early;
+2. waits until both calls have closed, whatever their outcome;
+3. forwards the request, or rejects it with 403 (or 503 if either call
+   failed).
+
+Request bodies can be larger than the Wasm VM's memory, so the plugin
+must never hold all of a body. It must also slow down when either call
+falls behind.
 
 ## Proposal
 
@@ -23,11 +29,14 @@ New hostcalls:
 
 New callbacks:
 - `proxy_on_http_stream_backpressure(stream_id, above_limit)`: send-side
-  flow control. The plugin is expected to `PAUSE` the downstream
-  `proxy_on_request_body` while above the limit, and to resume it with
-  `proxy_continue_stream` when the buffer drains.
-- `proxy_on_http_stream_close(stream_id)`: always called exactly once;
-  details are available through `proxy_get_status`.
+  flow control. While a call is above its limit, the plugin stops
+  sending and leaves the unsent data in the paused downstream request's
+  buffer.
+- `proxy_on_http_stream_close(stream_id)`: called **exactly once** per
+  call, whether it succeeded, was reset, failed, timed out, or its parent
+  context was torn down. Details are available through
+  `proxy_get_status`. That guarantee is what lets a plugin wait reliably
+  for several calls to finish.
 
 Reused, per #66:
 - The response is delivered through `proxy_on_response_headers`,
@@ -41,18 +50,65 @@ Reused, per #66:
   `proxy_continue_stream(stream_id, HTTP_RESPONSE)` releases a paused,
   buffered response body.
 
-Example flow (spill-to-store):
+A call's parent can be either a request context or the plugin context.
+A call parented to the plugin context outlives the request. For example,
+the spill call can then finish recording, or be explicitly marked
+partial, after the client aborts.
 
-```
-on_request_headers(ctx):   id = proxy_http_stream(ctx, "spill", hdrs, false, 0)
-on_request_body(ctx, n):   chunk = get_buffer_bytes(ctx, HTTP_REQUEST_BODY)
-                           proxy_http_stream_send(id, chunk, eos)
-                           return paused_by_backpressure ? PAUSE : CONTINUE
+## Worked example: cap, tee, sync, forward
+
+This flow works end to end with only this PR. Requests over a
+configured cap are rejected with 413 ("spiked"). The cap is enforced on
+the host buffer, so it can be much larger than Wasm memory, and the
+plugin's memory stays at about one chunk.
+
+```text
+on_request_headers(ctx):
+  if content-length > CAP: send_local_response(413); return PAUSE
+  spill = proxy_http_stream(PLUGIN_CTX, "spill", [PUT /spill/{key}], false, 0)
+  gov   = proxy_http_stream(ctx, "governance", [POST /verdict, x-spill-key], false, 30s)
+  return PAUSE
+
+on_request_body(ctx, body_size, eos):          -- body stays in the host buffer
+  if body_size > CAP: reset legs; send_local_response(413); return PAUSE
+  if !spill.above && !gov.above: tee(ctx)      -- send from offset tee_off to each live call
+  return PAUSE
+
 on_http_stream_backpressure(id, above):
-                           if !above: proxy_continue_stream(ctx, HTTP_REQUEST)
-on_response_headers(id, status, eos): record spill result
-on_http_stream_close(id):  done
+  leg(id).above = above
+  if !blocked(): tee(ctx)                      -- request is paused, buffer still accessible
+
+on_response_body(gov, n, eos):  buffer verdict JSON (PAUSE until eos)
+
+on_http_stream_close(id):
+  leg(id).done = true
+  if spill.done && gov.done:                   -- wait for both calls
+    if either failed:   send_local_response(503)
+    elif verdict.deny:  send_local_response(403)
+    else:               proxy_continue_stream(ctx, HTTP_REQUEST)   -- original body
 ```
+
+The full walkthrough is in the linked notes. It includes the version
+with no size cap, early-deny policy, and client-abort handling.
+
+## Related issues
+
+This PR covers the callout side. Handling request bodies **with no
+size cap** end to end also needs these existing issues:
+
+- **#63:** in Envoy, `PAUSE` from a body callback maps to
+  `StopIterationAndBuffer`, which returns 413 on buffer overflow instead
+  of applying backpressure to the client. proxy-wasm-cpp-host already
+  passes `StopIterationAndWatermark` (`2`) through, but the spec
+  and SDKs don't expose it. The text of
+  `proxy_on_http_stream_backpressure` notes this limitation.
+- **#64 / #65:** if the body is drained to the spill store instead of
+  buffered, an approved request has to be re-sent by streaming the body
+  back into the paused request. That needs "flush partial body" and
+  control of `end_of_stream`.
+- Streaming local responses are another missing piece. They would be
+  needed to send the request to the provider as a callout and relay its
+  streamed (SSE) response back to the client.
 
 ## Host implementation notes
 
@@ -84,7 +140,8 @@ reset… hard limit").
 2. Lifecycle (#110): the stream context is created implicitly, without
    `proxy_on_context_create`, which matches the direction in #110.
    `proxy_on_http_stream_close` could become `proxy_on_context_finalize`
-   once #110 lands, as long as `proxy_get_status` stays callable from it.
+   once #110 lands, as long as `proxy_get_status` stays callable from it
+   and it's still called exactly once.
 3. gRPC: message-level streaming already exists (`proxy_grpc_stream` /
    `proxy_grpc_send`), so this PR is HTTP-only. If #68 moves gRPC into
    SDKs, gRPC streaming would sit on top of these hostcalls. Otherwise,
@@ -92,3 +149,9 @@ reset… hard limit").
 4. Should `timeout = 0` mean "no timeout", or "host default"?
 5. Naming: `proxy_http_stream` follows `proxy_grpc_stream`, but it is
    easy to confuse with the downstream "HTTP streams" section.
+6. Zero-copy sending: today each chunk crosses the Wasm boundary once per
+   destination. A hostcall such as
+   `proxy_http_stream_send_buffer(stream_id, source_context_id, buffer_id, start, size, end_of_stream)`
+   would let hosts tee and mirror without copying through Wasm memory.
+   In Envoy that just moves buffer slices. Worth adding here, or as a
+   follow-up?
