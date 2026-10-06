@@ -1359,6 +1359,11 @@ Streaming HTTP calls associated with `plugin_context_id` can outlive
 the HTTP stream that started them (e.g. to finish recording a request
 after the downstream aborted it).
 
+While handling callbacks for a streaming HTTP call, plugins can access
+buffers and maps of its parent context (e.g. to forward request body to
+the streaming HTTP call, or to modify the paused parent request based on
+the response), subject to the usual restrictions of that context.
+
 
 ### Functions exposed by the host
 
@@ -2309,6 +2314,10 @@ Plugins can change the effective context to a different connection/request.
 
 Hosts should be aware of this, and might limit the ability to perform context
 changes to unrelated connections/requests.
+
+Streaming HTTP calls are not unrelated to their parent context, and hosts
+should allow plugins to access the parent context while handling callbacks
+for streaming HTTP calls.
 
 
 # Types
