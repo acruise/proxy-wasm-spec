@@ -532,6 +532,9 @@ in this section is restricted to specific callbacks:
   is paused from it).
 - `HTTP_CALL_RESPONSE_BODY` can be read in
   [`proxy_on_http_call_response`].
+- `HTTP_RESPONSE_BODY` of a [streaming HTTP call] can be read in
+  [`proxy_on_response_body`] (or for as long as response processing
+  is paused from it).
 - `GRPC_CALL_MESSAGE` can be read in [`proxy_on_grpc_receive`].
 - `VM_CONFIGURATION` can be read in [`proxy_on_vm_start`].
 - `PLUGIN_CONFIGURATION` can be read in [`proxy_on_configure`].
@@ -647,6 +650,15 @@ functions in this section is restricted to specific callbacks:
   [`proxy_on_http_call_response`].
 - `HTTP_CALL_RESPONSE_TRAILERS` can be read in
   [`proxy_on_http_call_response`].
+- `HTTP_REQUEST_TRAILERS` of a [streaming HTTP call] can be added
+  before the final call to [`proxy_http_stream_send`] (with
+  `end_of_stream` set to `true`).
+- `HTTP_RESPONSE_HEADERS` of a [streaming HTTP call] can be read in
+  [`proxy_on_response_headers`] (or for as long as response processing
+  is paused from it).
+- `HTTP_RESPONSE_TRAILERS` of a [streaming HTTP call] can be read in
+  [`proxy_on_response_trailers`] (or for as long as response processing
+  is paused from it).
 
 
 ### Functions exposed by the host
@@ -843,9 +855,10 @@ Returned `status` value is:
 
 Retrieves status code (`return_status_code`) and status message
 (`return_status_message_data`, `return_status_message_size`) of the HTTP call
-`call_or_stream_id` when called from [`proxy_on_http_call_response`]
-or gRPC stream or call `call_or_stream_id` when called from
-[`proxy_on_grpc_close`].
+`call_or_stream_id` when called from [`proxy_on_http_call_response`],
+streaming HTTP call `call_or_stream_id` when called from
+[`proxy_on_http_stream_close`], or gRPC stream or call
+`call_or_stream_id` when called from [`proxy_on_grpc_close`].
 
 Returned `status` value is:
 - `OK` on success.
@@ -1080,6 +1093,10 @@ Plugin must return one of the following values:
 
 Called when HTTP response headers are received from upstream.
 
+This callback is also called for the response of a [streaming HTTP call],
+in which case `stream_context_id` is the `return_stream_id` returned
+by [`proxy_http_stream`].
+
 The `status_code` represents the HTTP status code of the response.
 
 All HTTP response headers can be retrieved and/or modified using
@@ -1114,6 +1131,10 @@ Plugin must return one of the following values:
 Called for each chunk of HTTP response body received from upstream,
 even when the processing is paused.
 
+This callback is also called for the response of a [streaming HTTP call],
+in which case `stream_context_id` is the `return_stream_id` returned
+by [`proxy_http_stream`].
+
 Response body chunk (of `body_size`) can be retrieved and/or modified
 using [`proxy_get_buffer_bytes`] and/or [`proxy_set_buffer_bytes`]
 with `buffer_id` set to `HTTP_RESPONSE_BODY`.
@@ -1139,6 +1160,10 @@ Plugin must return one of the following values:
   - `i32 (`[`proxy_action_t`]`) action`
 
 Called when HTTP response trailers are received from upstream.
+
+This callback is also called for the response of a [streaming HTTP call],
+in which case `stream_context_id` is the `return_stream_id` returned
+by [`proxy_http_stream`].
 
 All HTTP response trailers can be retrieved and/or modified using
 [`proxy_get_header_map_pairs`] and/or [`proxy_set_header_map_pairs`]
@@ -1266,6 +1291,202 @@ All HTTP response trailers can be retrieved using
 `HTTP_CALL_RESPONSE_TRAILERS`.
 
 The presence of trailers is indicated by `has_trailers=1`.
+
+
+## Streaming HTTP calls
+
+Streaming HTTP calls allow plugins to send HTTP requests and receive
+HTTP responses of arbitrary size in chunks, without buffering the
+complete request or response in either the plugin or the host.
+
+A streaming HTTP call is opened using [`proxy_http_stream`], which
+sends HTTP request headers and returns a new stream identifier.
+The host implicitly creates a stream context for it, and
+[`proxy_on_context_create`] is not called.
+
+The stream identifier is a context identifier, and it's allocated from
+the same namespace as all other context identifiers. It must not be equal
+to the identifier of any other context that is alive at the same time,
+including other streaming HTTP calls, since callbacks shared with HTTP
+streams are distinguished only by their `stream_context_id`.
+
+HTTP request body is sent in chunks using [`proxy_http_stream_send`].
+HTTP request trailers can be added using [`proxy_set_header_map_pairs`]
+or [`proxy_add_header_map_value`] with `map_id` set to
+`HTTP_REQUEST_TRAILERS`, before the final call to
+[`proxy_http_stream_send`] with `end_of_stream` set to `true`.
+
+HTTP response is delivered using the existing HTTP stream callbacks
+([`proxy_on_response_headers`], [`proxy_on_response_body`]
+and [`proxy_on_response_trailers`]) with `stream_context_id` set to
+the stream identifier. The response can be received while the request
+is still being sent.
+
+Returning `CONTINUE` from [`proxy_on_response_body`] indicates that
+the plugin consumed the available response body, which is then
+discarded by the host.
+
+Returning `PAUSE` from [`proxy_on_response_body`] retains the response
+body in the host's buffer. As with HTTP streams, [`proxy_on_response_body`]
+continues to be called as more data is received, and `body_size`
+represents the total size of the buffered body. The buffered body is
+discarded once `CONTINUE` is returned from [`proxy_on_response_body`],
+or when processing is resumed using [`proxy_continue_stream`] with
+`stream_type` set to `HTTP_RESPONSE`. Hosts should apply backpressure
+to the upstream while the buffered body is above a host-defined limit,
+and they may reset the streaming HTTP call when it exceeds
+a host-defined hard limit.
+
+Values returned from [`proxy_on_response_headers`] and
+[`proxy_on_response_trailers`] for streaming HTTP calls are ignored.
+
+The streaming HTTP call can be reset at any time using
+[`proxy_close_stream`] with `stream_type` set to either `HTTP_REQUEST`
+or `HTTP_RESPONSE`.
+
+[`proxy_on_http_stream_close`] is always called exactly once, after
+both request and response are complete, or after the streaming HTTP
+call is reset, fails, or exceeds its `timeout`. The stream identifier
+is invalid after that callback returns.
+
+Streaming HTTP calls are associated with `parent_context_id` (either
+`plugin_context_id` or `stream_context_id`) and bound to its lifetime.
+Outstanding streaming HTTP calls are reset when their parent context
+is finalized, and [`proxy_on_http_stream_close`] is called for each of
+them before that happens.
+
+
+### Functions exposed by the host
+
+#### `proxy_http_stream`
+
+* params:
+  - `i32 (uint32_t) parent_context_id`
+  - `i32 (const char *) upstream_name_data`
+  - `i32 (size_t) upstream_name_size`
+  - `i32 (const uint8_t *) serialized_headers_data`
+  - `i32 (size_t) serialized_headers_size`
+  - `i32 (bool) end_of_stream`
+  - `i32 (uint32_t) timeout`
+  - `i32 (uint32_t *) return_stream_id`
+* returns:
+  - `i32 (`[`proxy_status_t`]`) status`
+
+Opens a streaming HTTP call to upstream (`upstream_name_data`,
+`upstream_name_size`) and sends HTTP request with [serialized] headers
+(`serialized_headers_data`, `serialized_headers_size`).
+
+When `end_of_stream` is `true`, the HTTP request consists only of
+headers, and [`proxy_http_stream_send`] cannot be used.
+
+The `timeout` (in milliseconds) applies to the entire streaming HTTP
+call, from opening until both request and response are complete.
+Value `0` means no timeout, in which case the host may still enforce
+its own limits.
+
+HTTP request body can be sent using [`proxy_http_stream_send`] with
+the returned stream identifier (`return_stream_id`), which is unique
+among all live contexts.
+
+Returned `status` value is:
+- `OK` on success.
+- `UNKNOWN_RESOURCE_ID` for unknown `parent_context_id`.
+- `BAD_ARGUMENT` for unknown `upstream`, or when `headers` are missing
+  required `:authority`, `:method` and/or `:path` values.
+- `INTERNAL_FAILURE` when the host failed to open the streaming HTTP call.
+- `INVALID_MEMORY_ACCESS` when `upstream_name_data`,
+  `upstream_name_size`, `serialized_headers_data`,
+  `serialized_headers_size` and/or `return_stream_id` point to invalid
+  memory address.
+
+
+#### `proxy_http_stream_send`
+
+* params:
+  - `i32 (uint32_t) stream_id`
+  - `i32 (const uint8_t *) body_data`
+  - `i32 (size_t) body_size`
+  - `i32 (bool) end_of_stream`
+* returns:
+  - `i32 (`[`proxy_status_t`]`) status`
+
+Sends a chunk of HTTP request body (`body_data`, `body_size`) on the
+streaming HTTP call `stream_id` previously opened using
+[`proxy_http_stream`].
+
+The data is copied by the host, so the plugin can release its memory
+as soon as this function returns.
+
+When `end_of_stream` is `true`, this is the final chunk of HTTP request
+body, and HTTP request trailers, if they were added, are sent after it.
+`body_size` may be `0` in order to end the HTTP request without sending
+more data.
+
+The host accepts the data even when its send buffer for `stream_id`
+is above its limit, but it notifies the plugin about it using
+[`proxy_on_http_stream_backpressure`], and plugins should stop sending
+data until notified that the backpressure was released. Hosts may reset
+the streaming HTTP call if plugin continues sending data, and its send
+buffer exceeds a host-defined hard limit.
+
+Returned `status` value is:
+- `OK` on success.
+- `UNKNOWN_RESOURCE_ID` for unknown `stream_id`.
+- `BAD_ARGUMENT` when the HTTP request for `stream_id` was already
+  ended.
+- `INVALID_MEMORY_ACCESS` when `body_data` and/or `body_size` point
+  to invalid memory address.
+
+
+### Callbacks exposed by the Wasm module
+
+#### `proxy_on_http_stream_backpressure`
+
+* params:
+  - `i32 (uint32_t) stream_id`
+  - `i32 (bool) above_limit`
+* returns:
+  - none
+
+Called when the amount of HTTP request body buffered by the host for
+the streaming HTTP call `stream_id`, and not yet sent upstream, crosses
+the host-defined limits.
+
+When `above_limit` is `true`, the plugin should stop calling
+[`proxy_http_stream_send`] for `stream_id`. When the data originates
+from a downstream HTTP request, this can be achieved by returning
+`PAUSE` from [`proxy_on_request_body`].
+
+When `above_limit` is `false`, the buffered data was drained, and the
+plugin can resume sending data (e.g. using [`proxy_continue_stream`]
+with `stream_type` set to `HTTP_REQUEST` for the paused downstream
+HTTP request).
+
+Calls with `above_limit` set to `true` and `false` always alternate,
+starting with `true`.
+
+
+#### `proxy_on_http_stream_close`
+
+* params:
+  - `i32 (uint32_t) stream_id`
+* returns:
+  - none
+
+Called when the streaming HTTP call `stream_id` opened using
+[`proxy_http_stream`] is closed, either after both HTTP request
+and response were completed, or after it was reset, failed, or exceeded
+its `timeout`.
+
+The HTTP status code and status message can be retrieved using
+[`proxy_get_status`]. Status code `0` means that the HTTP response
+headers were not received.
+
+Streaming HTTP calls that completed successfully always deliver
+the HTTP response with `end_of_stream` set to `true` (or HTTP response
+trailers) before this callback is called.
+
+No other callbacks for `stream_id` are called after this callback.
 
 
 ## gRPC calls
@@ -2184,6 +2405,7 @@ changes to unrelated connections/requests.
 [integration]: #Integration
 [memory management]: #Memory-management
 [serialized]: #Serialization
+[streaming HTTP call]: #Streaming-HTTP-calls
 
 [`proxy_abi_version_0_x_x`]: #proxy_abi_version_0_x_x
 [`_initialize`]: #_initialize
@@ -2229,6 +2451,10 @@ changes to unrelated connections/requests.
 [`proxy_send_local_response`]: #proxy_send_local_response
 [`proxy_http_call`]: #proxy_http_call
 [`proxy_on_http_call_response`]: #proxy_on_http_call_response
+[`proxy_http_stream`]: #proxy_http_stream
+[`proxy_http_stream_send`]: #proxy_http_stream_send
+[`proxy_on_http_stream_backpressure`]: #proxy_on_http_stream_backpressure
+[`proxy_on_http_stream_close`]: #proxy_on_http_stream_close
 [`proxy_grpc_call`]: #proxy_grpc_call
 [`proxy_grpc_stream`]: #proxy_grpc_stream
 [`proxy_grpc_send`]: #proxy_grpc_send
