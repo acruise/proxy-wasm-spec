@@ -503,6 +503,73 @@ plugin speaking the store's protocol. Signing through Envoy's filter
 would make that much more manageable.
 
 
+## Early deny and HTTP versions
+
+### Early deny over HTTP
+
+The governance endpoint can deny before it has the whole request,
+without dropping a socket:
+
+- **HTTP/2 (recommended):** RFC 9113 §8.1 lets a server send a complete
+  response before the request is finished, and then send `RST_STREAM`
+  with `NO_ERROR` to ask the client to stop uploading. The client must
+  not discard the response because of that reset. Only the stream ends,
+  and the connection is reused.
+
+  ```text
+  HEADERS     :status 200, x-verdict: deny
+  DATA        {"reason": ...}   END_STREAM
+  RST_STREAM  NO_ERROR          -- "stop uploading", not an error
+  ```
+
+- **HTTP/3:** the same, with `STOP_SENDING` and `H3_NO_ERROR`.
+- **HTTP/1.1:** send the response early with `Connection: close`, then
+  close. That's graceful, but it costs the connection. The alternative
+  is to read and discard the rest of the body, which defeats the purpose.
+- **Full-duplex verdict channel (HTTP/2):** send response headers right
+  away, then stream verdict events (NDJSON or SSE) while still reading.
+  The plugin decides whether to stop sending (`proxy_close_stream`) or
+  to finish. This leaves room for verdicts such as "provisional deny" or
+  "need more", and is closer to `ext_proc`.
+
+What the plugin sees: `proxy_on_response_headers` (deny), then
+`proxy_on_response_body` with `end_of_stream`, then
+`proxy_on_http_stream_close`, with `proxy_get_status` returning the
+final status. The spec now says that an upstream completing the response
+early isn't a failure. Sends made after that point return `OK` and are
+discarded, so a plugin in the middle of teeing doesn't have to handle a
+race.
+
+**To verify in Envoy:** whether `AsyncClient` reports a `NO_ERROR`
+reset after a complete response as a normal completion or as a reset.
+
+### HTTP versions
+
+The proposed API doesn't depend on the HTTP version, which the host
+chooses from the upstream's configuration. The spec now spells out the
+rules that keep it that way:
+
+- pseudo-headers, translated by the host as needed;
+- no connection-specific headers from plugins;
+- if `content-length` is set, it must match the body actually sent,
+  otherwise the host chooses the framing;
+- request trailers are best-effort (HTTP/1.1 can't send them alongside
+  `content-length`);
+- 1xx responses are handled by the host, and plugins don't send `Expect`;
+- no `CONNECT` or protocol upgrades.
+
+Backpressure needs nothing version-specific (Envoy's watermarks cover
+all versions).
+
+For this design: put the `governance` cluster on **HTTP/2**, since early
+deny, full-duplex verdicts and trailers only work well there. S3
+multipart upload works on any version, because it doesn't rely on full
+duplex or trailers, and each part has a fixed `content-length`.
+
+Not proposed: a property exposing the negotiated version on the callout
+context, e.g. `upstream.protocol`.
+
+
 ## Substituting a governed request
 
 Governance doesn't only allow or deny. It can also return a **governed

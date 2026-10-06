@@ -127,6 +127,24 @@ Without a size cap, it needs the same #64/#65 work as above. A full
 governance protocol is out of scope here, but Envoy's `ext_proc`
 `FULL_DUPLEX_STREAMED` mode is the closest prior art.
 
+## HTTP versions and early responses
+
+The API doesn't depend on the HTTP version: the host chooses it from the
+upstream's configuration, as with `proxy_http_call`. The spec states the
+rules that keep it that way:
+
+- pseudo-headers, converted by the host as needed;
+- no connection-specific headers from plugins;
+- `content-length`, if set, must match the body actually sent;
+- request trailers are best-effort;
+- 1xx responses are handled by the host;
+- no `CONNECT` or protocol upgrades.
+
+An upstream may complete the response before the request is finished,
+e.g. an early deny with HTTP/2 `RST_STREAM(NO_ERROR)`. That isn't
+a failure: the plugin gets the complete response, then the close
+callback, and sends made in the meantime are accepted and discarded.
+
 ## Host implementation notes
 
 The design maps directly onto Envoy's `Http::AsyncClient::Stream`:
@@ -180,7 +198,10 @@ reset… hard limit").
 4. Should `timeout = 0` mean "no timeout", or "host default"?
 5. Naming: `proxy_http_stream` follows `proxy_grpc_stream`, but it is
    easy to confuse with the downstream "HTTP streams" section.
-6. Zero-copy sending: today each chunk crosses the Wasm boundary once per
+6. Request trailers on HTTP/1.1: best-effort (current text), or require
+   hosts to switch to chunked encoding and drop `content-length` when
+   trailers are present?
+7. Zero-copy sending: today each chunk crosses the Wasm boundary once per
    destination. A hostcall such as
    `proxy_http_stream_send_buffer(stream_id, source_context_id, buffer_id, start, size, end_of_stream)`
    would let hosts tee and mirror without copying through Wasm memory.
