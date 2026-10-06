@@ -1320,7 +1320,16 @@ HTTP response is delivered using the existing HTTP stream callbacks
 ([`proxy_on_response_headers`], [`proxy_on_response_body`]
 and [`proxy_on_response_trailers`]) with `stream_context_id` set to
 the stream identifier. The response can be received while the request
-is still being sent.
+is still being sent, when supported by the HTTP version used with
+the upstream (e.g. HTTP/2 and HTTP/3), but plugins must not rely on it.
+
+The upstream can complete the HTTP response before the HTTP request
+is complete. In such case, the host may stop sending the HTTP request
+(e.g. when the upstream requested it by sending `RST_STREAM` with
+`NO_ERROR` in HTTP/2 or `STOP_SENDING` with `H3_NO_ERROR` in HTTP/3,
+or when it closed the connection after the response in HTTP/1.1).
+This is not a failure: the complete HTTP response is delivered with
+`end_of_stream` set to `true`, followed by [`proxy_on_http_stream_close`].
 
 Returning `CONTINUE` from [`proxy_on_response_body`] indicates that
 the plugin consumed the available response body, which is then
@@ -1364,6 +1373,27 @@ buffers and maps of its parent context (e.g. to forward request body to
 the streaming HTTP call, or to modify the paused parent request based on
 the response), subject to the usual restrictions of that context.
 
+Streaming HTTP calls are independent of the HTTP version, which is
+selected by the host based on the configuration of the upstream.
+Hosts are responsible for framing of the HTTP request and response:
+- HTTP request headers use pseudo-headers (`:method`, `:path`,
+  `:authority`, etc.), which hosts convert as needed (e.g. into
+  request line and `Host` header in HTTP/1.1).
+- Connection-specific headers (`connection`, `keep-alive`,
+  `proxy-connection`, `transfer-encoding`, `upgrade`, and `te` with
+  any value other than `trailers`) must not be set by plugins.
+- When `content-length` is set, the total size of HTTP request body
+  sent using [`proxy_http_stream_send`] must match it, otherwise the host
+  resets the streaming HTTP call. Otherwise, the host uses framing
+  appropriate for the HTTP version (e.g. chunked transfer coding
+  in HTTP/1.1).
+- HTTP request trailers are sent on a best-effort basis, and they might
+  be dropped when they cannot be represented (e.g. in HTTP/1.1 requests
+  with `content-length`).
+- Interim (1xx) HTTP responses are handled by the host and not delivered
+  to the plugin, and plugins must not set the `expect` header.
+- `CONNECT` requests and protocol upgrades are not supported.
+
 
 ### Functions exposed by the host
 
@@ -1400,8 +1430,10 @@ among all live contexts.
 Returned `status` value is:
 - `OK` on success.
 - `UNKNOWN_RESOURCE_ID` for unknown `parent_context_id`.
-- `BAD_ARGUMENT` for unknown `upstream`, or when `headers` are missing
-  required `:authority`, `:method` and/or `:path` values.
+- `BAD_ARGUMENT` for unknown `upstream`, when `headers` are missing
+  required `:authority`, `:method` and/or `:path` values, or when they
+  contain connection-specific headers, the `expect` header, `CONNECT`
+  method or a protocol upgrade.
 - `INTERNAL_FAILURE` when the host failed to open the streaming HTTP call.
 - `INVALID_MEMORY_ACCESS` when `upstream_name_data`,
   `upstream_name_size`, `serialized_headers_data`,
@@ -1437,6 +1469,9 @@ is above its limit, but it notifies the plugin about it using
 data until notified that the backpressure was released. Hosts may reset
 the streaming HTTP call if plugin continues sending data, and its send
 buffer exceeds a host-defined hard limit.
+
+If the host stopped sending the HTTP request, because the upstream
+completed the HTTP response early, data is accepted and discarded.
 
 Returned `status` value is:
 - `OK` on success.
