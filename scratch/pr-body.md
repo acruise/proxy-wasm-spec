@@ -110,6 +110,23 @@ size cap** end to end also needs these existing issues:
   needed to send the request to the provider as a callout and relay its
   streamed (SSE) response back to the client.
 
+## Possible future work: substituting a governed request
+
+Beyond allow/deny, governance may return a governed version of the
+request (PII redacted, system instructions replaced) to forward instead.
+With a size cap, this already works on top of this PR:
+
+- the governance call's response headers carry the verdict and any
+  header mutations;
+- its response body is the governed request body;
+- the plugin drops the original from the paused request's buffer,
+  appends the governed bytes, fixes `content-length` (the headers are
+  still paused), and continues the request.
+
+Without a size cap, it needs the same #64/#65 work as above. A full
+governance protocol is out of scope here, but Envoy's `ext_proc`
+`FULL_DUPLEX_STREAMED` mode is the closest prior art.
+
 ## Host implementation notes
 
 The design maps directly onto Envoy's `Http::AsyncClient::Stream`:

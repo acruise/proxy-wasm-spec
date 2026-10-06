@@ -386,6 +386,116 @@ out of scope here, as a "don't return output" policy rather than "don't
 send input". It also needs nothing beyond this proposal, which is
 useful to know for that later work.
 
+## Substituting a governed request
+
+Governance doesn't only allow or deny. It can also return a **governed
+version** of the request (with PII redacted, system instructions
+replaced, and so on), which is forwarded instead of the original. This
+may be beyond the scope of the PR, but it's worth checking how far the
+ABI gets.
+
+### Governance protocol
+
+The plugin and the governance endpoint have to agree on a protocol.
+A simple one uses the response of the streaming call:
+
+- **Response headers carry the verdict:** `x-verdict: allow | deny |
+  rewrite`, plus a denial reason or header mutations if needed (e.g.
+  `x-set-<name>`, or a JSON list in one header). Since this is in the
+  headers, the plugin knows the outcome before any body arrives.
+- **The response body, when the verdict is `rewrite`, is the governed
+  request body,** streamed.
+- **Governance starts the rewritten body only after it has received the
+  whole request.** This is natural for JSON payloads, which have to be
+  parsed whole anyway. It also means the plugin never has to hold both
+  bodies in flight at once (see below).
+
+Envoy's `ext_proc` filter, in its `FULL_DUPLEX_STREAMED` body mode, is
+prior art for a streamed body-mutation protocol. It's worth borrowing its
+message shapes, even though the gateway's own logic (tee, spill, waiting
+for both calls) stays in Wasm.
+
+### With Option B (capped): works with this proposal
+
+The original body is in the host buffer, and the request is still paused
+from `proxy_on_request_headers`. So both the body **and the headers** can
+still be changed:
+
+```text
+on_response_headers(gov.id, status, eos):
+  verdict = get_header_map_value(gov.id, HTTP_RESPONSE_HEADERS, "x-verdict")
+  apply header mutations to (ctx, HTTP_REQUEST_HEADERS)   -- allowed: still paused
+  return CONTINUE
+
+on_response_body(gov.id, n, eos):
+  if verdict != rewrite: (verdict-only body, as before)
+  if not swapped:                       -- first rewritten chunk
+    assert tee_off == total and req_eos -- spill has the whole original
+    proxy_set_buffer_bytes(ctx, HTTP_REQUEST_BODY, 0, total, "")   -- drop original
+    swapped = true
+  chunk = proxy_get_buffer_bytes(gov.id, HTTP_RESPONSE_BODY, 0, n)
+  if rewritten_size + n > CAP: fail closed (503)
+  proxy_set_buffer_bytes(ctx, HTTP_REQUEST_BODY, MAX, 0, chunk)    -- append governed bytes
+  optionally tee chunk to a second spill object: spill/{key}.governed
+  rewritten_size += n
+  return CONTINUE                       -- consume from the gov call's buffer
+
+decide(ctx) on rewrite (both calls closed):
+  proxy_set_header_map_value(ctx, HTTP_REQUEST_HEADERS, "content-length", rewritten_size)
+  proxy_continue_stream(ctx, HTTP_REQUEST)   -- forwards the governed request
+```
+
+Notes:
+- **`content-length`:** the plugin has to fix it, because Envoy doesn't
+  recompute it when a filter replaces the body. The headers are still
+  paused, so the plugin can set the exact size at the end. Alternatively,
+  it can remove the header up front and let the upstream codec use
+  chunked encoding or HTTP/2 framing.
+- **Memory:** the host holds at most one body at a time, because the
+  original is dropped before the governed bytes are appended. Plugin
+  memory stays O(chunk). The governed body needs its own cap, and
+  exceeding it fails closed.
+- **Audit:** spilling the governed body too (`{key}.governed`) gives a
+  before/after pair, for no extra memory.
+- **Order of operations:** if governance starts streaming the rewrite
+  before the plugin has finished teeing the original, the plugin can
+  `PAUSE` the governance response. That leaves the bytes in the gov call's
+  receive buffer until `tee_off == total`. In Envoy, that buffer has a
+  limit and its overflow resets the call, so it's better to rule this
+  out in the protocol.
+
+### With Option A (unbounded): blocked on the same gap 2
+
+Rewriting actually makes Option A simpler: the governed body comes
+straight from governance, so the spill `GET` disappears. But streaming it
+into the request still needs a flush that doesn't end the request (#65)
+and control of `end_of_stream` (#64). It's the same gap 2.
+
+### Spec clarification this relies on
+
+Like the tee itself, the rewrite runs inside callbacks for the
+**callout** (`gov.id`), while modifying the **parent request's**
+buffers and maps (`ctx`). The spec's Security Considerations say hosts
+"might limit the ability to perform context changes to unrelated
+connections/requests". A parent and its own callout aren't unrelated,
+but the spec should say so explicitly. While handling callbacks for a
+streaming HTTP call, a plugin may access the buffers and maps of the
+call's parent context (subject to that context's usual pause rules).
+That clarification is in scope, since the tee needs it too, and it's
+now in the spec (in the Streaming HTTP calls section and in Security
+Considerations).
+
+### Response side
+
+The same pattern applies in reverse, for example restoring redacted
+placeholders, or governing the model's output. In that case the governance
+call is fed from `proxy_on_response_body`. SSE responses are usually
+streamed, so with a cap that means buffering the whole response (losing
+token-by-token streaming), or using a full-duplex governance protocol
+working chunk by chunk. That is a separate design and is out of scope
+here.
+
+
 ## Today, with gRPC streams
 
 The ABI already has streaming gRPC calls (`proxy_grpc_stream`,
@@ -479,5 +589,9 @@ For parity, gRPC streams would need the same three things.
    the application protocol, but they lack backpressure, exactly-once
    close and a timeout. That's the case for giving them the same
    treatment (see "Today, with gRPC streams").
-7. Open question: a zero-copy `proxy_http_stream_send_buffer`, for
+7. Substituting a governed request (redaction, rewritten instructions)
+   works with Option B and this proposal. Mention it in the PR as
+   possible future work. The one in-scope item is a spec sentence saying
+   a call's callbacks may access its parent context's buffers and maps.
+8. Open question: a zero-copy `proxy_http_stream_send_buffer`, for
    tee or mirroring.
