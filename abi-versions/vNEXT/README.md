@@ -1355,6 +1355,10 @@ Outstanding streaming HTTP calls are reset when their parent context
 is finalized, and [`proxy_on_http_stream_close`] is called for each of
 them before that happens.
 
+Streaming HTTP calls associated with `plugin_context_id` can outlive
+the HTTP stream that started them (e.g. to finish recording a request
+after the downstream aborted it).
+
 
 ### Functions exposed by the host
 
@@ -1453,14 +1457,21 @@ the streaming HTTP call `stream_id`, and not yet sent upstream, crosses
 the host-defined limits.
 
 When `above_limit` is `true`, the plugin should stop calling
-[`proxy_http_stream_send`] for `stream_id`. When the data originates
-from a downstream HTTP request, this can be achieved by returning
-`PAUSE` from [`proxy_on_request_body`].
+[`proxy_http_stream_send`] for `stream_id`.
+
+Data that is not sent yet doesn't need to be copied into the plugin's
+memory. When it originates from a downstream HTTP request paused from
+[`proxy_on_request_body`], it remains in the `HTTP_REQUEST_BODY` buffer,
+and it can be retrieved later, since that buffer is accessible
+for as long as request processing is paused.
+
+Leaving data in the buffer of a paused downstream HTTP request throttles
+the downstream only if the host applies backpressure to the downstream
+while the request is paused. A host might instead fail the request once
+the buffered body exceeds its limit.
 
 When `above_limit` is `false`, the buffered data was drained, and the
-plugin can resume sending data (e.g. using [`proxy_continue_stream`]
-with `stream_type` set to `HTTP_REQUEST` for the paused downstream
-HTTP request).
+plugin can resume sending data.
 
 Calls with `above_limit` set to `true` and `false` always alternate,
 starting with `true`.
