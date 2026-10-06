@@ -143,9 +143,23 @@ reset… hard limit").
    once #110 lands, as long as `proxy_get_status` stays callable from it
    and it's still called exactly once.
 3. gRPC: message-level streaming already exists (`proxy_grpc_stream` /
-   `proxy_grpc_send`), so this PR is HTTP-only. If #68 moves gRPC into
-   SDKs, gRPC streaming would sit on top of these hostcalls. Otherwise,
-   `proxy_grpc_send` probably needs the same backpressure callback.
+   `proxy_grpc_send`), so this PR is HTTP-only. The existing gRPC streams
+   are enough to *move* the data in the example above, but in Envoy
+   they're missing what makes the flow reliable:
+   - **No send-side backpressure.** `proxy_grpc_send` always accepts,
+     although Envoy's async gRPC stream tracks
+     `isAboveWriteBufferHighWatermark`.
+   - **No exactly-once close.** `proxy_grpc_cancel` erases the stream
+     without a callback, and when the parent context is torn down,
+     `~Context` calls `resetStream()` after `onDone`/`onDelete`, so
+     `proxy_on_grpc_close` never fires.
+   - **No timeout.** The spec text for `proxy_grpc_stream` mentions one,
+     but the hostcall takes no `timeout` parameter, and Envoy doesn't set
+     one.
+
+   If #68 moves gRPC into SDKs, gRPC streaming would sit on top of these
+   hostcalls and get all three for free. Otherwise, `proxy_grpc_stream`
+   needs the same three things, in this PR or a follow-up.
 4. Should `timeout = 0` mean "no timeout", or "host default"?
 5. Naming: `proxy_http_stream` follows `proxy_grpc_stream`, but it is
    easy to confuse with the downstream "HTTP streams" section.

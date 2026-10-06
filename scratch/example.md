@@ -386,6 +386,75 @@ out of scope here, as a "don't return output" policy rather than "don't
 send input". It also needs nothing beyond this proposal, which is
 useful to know for that later work.
 
+## Today, with gRPC streams
+
+The ABI already has streaming gRPC calls (`proxy_grpc_stream`,
+`proxy_grpc_send`, `proxy_on_grpc_*`). They exist in v0.2.1 and are
+implemented in Envoy. So could a prototype run on current Envoy without
+this proposal? Partly. Findings from the spec and Envoy's
+`source/extensions/common/wasm/context.cc`:
+
+**What works:**
+- **Tee:** open one gRPC stream to a spill service and one to
+  a governance service, and `proxy_grpc_send` each body chunk to both
+  as a message (e.g. `bytes chunk`). Plugin memory stays O(chunk), and
+  the host does the gRPC framing.
+- **Early deny:** streams are bidirectional, so governance can send a
+  verdict message while the upload is still in progress.
+- **Outliving the request:** `parent_context_id` may be the plugin
+  context, so the spill stream can outlive the request.
+- **Option B** (cap, buffer in the host, tee from an offset) applies
+  unchanged.
+
+**What's missing:**
+
+| Need | gRPC streams today |
+|---|---|
+| Send-side backpressure | None. `proxy_grpc_send` always accepts, and nothing tells the plugin when a stream is backed up. Envoy's async gRPC stream tracks this (`isAboveWriteBufferHighWatermark`), but Proxy-Wasm doesn't expose it. |
+| Exactly-once close | No. `proxy_on_grpc_close` fires only when the remote side closes. `proxy_grpc_cancel` erases the stream with no callback. When the parent context is torn down, Envoy's `~Context` calls `resetStream()` silently, after `onDone`/`onDelete`. |
+| Timeout | None. The spec text for `proxy_grpc_stream` mentions a timeout, but the hostcall takes none, and Envoy doesn't set one. A hung governance stream hangs the request. |
+| Plain HTTP endpoints | No. Both services must speak gRPC. That's fine for services you own, but it rules out talking to an object store or an existing HTTP governance API directly. |
+
+### Workaround: flow control in the application protocol
+
+If you own both services, you can rebuild the missing pieces on top
+of what exists:
+
+- **Window per stream.** Each service periodically sends back an ack
+  message saying it has received up to byte N, which arrives through
+  `proxy_on_grpc_receive`. The plugin caps bytes in flight per stream:
+
+  ```text
+  in_flight = tee_off - acked_off
+  while in_flight < WINDOW and data buffered: send next chunk
+  on ack(n): acked_off = n; tee(ctx)
+  ```
+
+- **Timeout.** Start a one-shot timer (`proxy_create_timer`) per
+  request. When it fires, call `proxy_grpc_cancel` on both streams and
+  reply 503.
+- **Waiting for both streams.** Treat "remote closed", "cancelled by
+  me" and "timed out" as the same done state in plugin-side bookkeeping,
+  because only the first of them produces a callback.
+- **Client abort.** There's no callback for a governance stream torn
+  down with its request. The spill stream, parented to the plugin
+  context, must be cancelled from the request's `proxy_on_done` /
+  `proxy_on_log`, so that it's recorded as partial.
+
+Costs: throughput is limited to about one window per round trip, both
+services need a custom protocol, and the plugin carries bookkeeping that
+the ABI should provide. That's acceptable for a "poke and sniff"
+prototype on current Envoy, but not as the long-term design.
+
+### What this means for the proposal
+
+The gRPC path shows that the flow can be built. The streaming HTTP call
+proposal provides, as part of the ABI, exactly what the gRPC path is
+missing: host-driven backpressure, exactly-once close (including on
+reset and parent teardown), a real timeout, and plain HTTP endpoints.
+For parity, gRPC streams would need the same three things.
+
+
 ## Takeaways for the PR
 
 1. Option B (cap, buffer in the host, spike anything bigger) works
@@ -406,5 +475,9 @@ useful to know for that later work.
 5. The `proxy_on_http_stream_backpressure` text should say that pausing
    the downstream request only gives backpressure if the host's pause
    doesn't fail on buffer overflow (see gap 1).
-6. Open question: a zero-copy `proxy_http_stream_send_buffer`, for
+6. gRPC streams can run Option B today, using flow control built into
+   the application protocol, but they lack backpressure, exactly-once
+   close and a timeout. That's the case for giving them the same
+   treatment (see "Today, with gRPC streams").
+7. Open question: a zero-copy `proxy_http_stream_send_buffer`, for
    tee or mirroring.
