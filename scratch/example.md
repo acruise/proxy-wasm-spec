@@ -51,9 +51,10 @@ the key to governance in a request header, so governance can correlate
 the two, or read the spill itself if it wants to re-scan.
 
 The spill store needs to accept a chunked upload of unknown length.
-Plain S3 `PUT` doesn't, so in practice this is a small spill service in
-front of an object store, using multipart upload, or a store that
-accepts chunked uploads natively.
+Plain S3 `PUT` doesn't. So in practice this is a small spill service
+in front of an object store, a store that accepts chunked uploads
+natively, or the plugin driving S3 multipart upload itself (see
+[Spill store: S3 multipart upload](#spill-store-s3-multipart-upload)).
 
 ## Sequence (Option A)
 
@@ -385,6 +386,122 @@ synchronous governance. It belongs with the asynchronous modes that are
 out of scope here, as a "don't return output" policy rather than "don't
 send input". It also needs nothing beyond this proposal, which is
 useful to know for that later work.
+
+## Spill store: S3 multipart upload
+
+The plugin can write to S3 directly, using multipart upload (MPU),
+instead of going through a custom spill service. This section is based
+on recollection of S3's multipart API and Envoy's AWS signing filter;
+neither has been checked against current documentation.
+
+### Mapping
+
+| Step | S3 call | When |
+|---|---|---|
+| Start | `POST /{key}?uploads` → `UploadId` (XML) | At `proxy_on_request_headers`, overlapping with the body arriving |
+| Each part | `PUT /{key}?partNumber=N&uploadId=…` → `ETag` (response header) | When P bytes are available, or at the end of the body |
+| Finish | `POST /{key}?uploadId=…` with an XML list of part numbers and ETags | After the last part. Its success is "spill done" for the sync. |
+| Failure | `DELETE /{key}?uploadId=…` | On reset or client abort |
+
+**The constraint that shapes it:** every part needs a `Content-Length`
+up front, and all parts except the last must be at least 5 MiB. There
+can be at most 10,000 parts, so 8 MiB parts give roughly 80 GB per
+object. So a part can't start until the plugin either has P bytes
+buffered or has seen the end of the body.
+
+```text
+state per ctx:  + upload_id, parts = [], part_no = 0, part_inflight = 0
+
+on_request_headers(ctx):
+  create_id = proxy_http_stream(PLUGIN_CTX, "s3", [POST /{key}?uploads], end_of_stream = true, ...)
+  -- or proxy_http_call: the response is small XML
+
+on_response_body(create_id, ...):  upload_id = parse UploadId from the XML
+
+maybe_start_part(ctx):              -- called from on_request_body and backpressure
+  avail = buffered - tee_off
+  if upload_id and part_inflight < MAX_PARALLEL and (avail >= P or (req_eos and avail > 0)):
+    size = req_eos ? min(avail, P) : P
+    part_no += 1
+    id = proxy_http_stream(PLUGIN_CTX, "s3",
+           [PUT /{key}?partNumber={part_no}&uploadId={upload_id},
+            content-length: size, x-amz-content-sha256: UNSIGNED-PAYLOAD],
+           end_of_stream = false, ...)
+    stream bytes [tee_off, tee_off + size) from the host buffer to id, observing backpressure
+    tee_off += size
+
+on_response_headers(part_id, status, eos):  parts[n] = ETag header (fail on non-2xx)
+
+when req_eos and all parts closed:
+  complete_id = proxy_http_call(PLUGIN_CTX, "s3", [POST /{key}?uploadId=…], xml(parts), ...)
+  spill.done = (complete returns 200 with no <Error>)   -- Complete can fail inside a 200 response
+```
+
+### With each option
+
+- **Option B (size cap, body kept in the host buffer):** this is the
+  natural fit. Parts stream straight from the host buffer at `tee_off`,
+  never enter Wasm memory, and can upload in parallel for throughput.
+- **Option A (no cap):** the host buffer must hold up to one part, so its
+  limit has to be at least P. Gap 1 applies to the bytes for the next
+  part that accumulate while the current one uploads.
+- **Today, without this proposal:** each part can be sent with buffered
+  `proxy_http_call`, with the part in Wasm memory. That's O(part), not
+  O(body), so it works. But all requests on an Envoy worker share one VM,
+  so the cost is concurrent uploads × P (e.g. 100 × 8 MiB = 800 MiB of
+  Wasm memory). With this proposal, Wasm memory is O(chunk).
+
+### Signing
+
+Every request needs AWS SigV4. This is the hardest part.
+
+- **In the plugin:** HMAC-SHA256 is fine in Wasm, and
+  `x-amz-content-sha256: UNSIGNED-PAYLOAD` (allowed over HTTPS) avoids
+  hashing each part before sending its headers. But the plugin then
+  needs AWS credentials, and it can't easily follow IRSA/STS rotation.
+- **In Envoy (preferred, if it works):** configure the
+  `aws_request_signing` filter as an upstream HTTP filter on the `s3`
+  cluster, with its unsigned-payload option. Envoy then signs the
+  callouts using its normal credential chain, and the plugin never sees
+  credentials. **Verify** that the filter supports upstream-filter mode
+  and unsigned payloads in the Envoy version in use, and that it applies
+  to async-client traffic.
+
+### Caveats
+
+- **Partial audit:** an aborted MPU leaves nothing. To keep a partial
+  body after a client abort, complete the upload with the parts uploaded
+  so far (the last part may be under 5 MiB), and mark it partial
+  afterwards with an object tag or a key suffix. Metadata is fixed when
+  the upload starts.
+- **Cleanup:** a plugin crash leaves incomplete uploads behind, so the
+  bucket needs an `AbortIncompleteMultipartUpload` lifecycle rule
+  regardless.
+- **Latency:** Create adds one round trip (overlapping with the body
+  arriving), and Complete adds one round trip before the sync.
+- **Small bodies:** when `content-length` is known and under the
+  threshold, a single `PutObject` is cheaper. An MPU with one part of any
+  size is also valid.
+- **Visibility:** the object doesn't exist until Complete succeeds.
+  That's fine here, since governance gets its own copy through the tee,
+  but it rules out reading the spill while it's still being written.
+- **Integrity:** with `UNSIGNED-PAYLOAD`, integrity relies on TLS.
+  S3's trailing checksums require `aws-chunked` encoding, not plain
+  HTTP trailers, so they don't map directly onto `HTTP_REQUEST_TRAILERS`.
+
+### Alternatives in the same family
+
+- **GCS resumable uploads:** chunks don't need the total size up front,
+  but have to be multiples of 256 KiB.
+- **Azure block blobs** (Put Block / Put Block List): like MPU, without
+  the 5 MiB minimum.
+- **S3 Express One Zone appends:** might make each chunk a plain
+  append. Less certain; verify before relying on it.
+
+All of these avoid running a custom spill service, at the cost of the
+plugin speaking the store's protocol. Signing through Envoy's filter
+would make that much more manageable.
+
 
 ## Substituting a governed request
 
